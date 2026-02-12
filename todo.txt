@@ -1,0 +1,2 @@
+- utilize the actors being starred in each movie from credits.csv (keyed by 'name'), would first run the user's query into an llm to reason out how to separate certain fields into genre, keywords, featured actors, etc., and our pipeline would decide to vectorize only certain fields)
+- build a set of all keywords to represent in some higher dimension space
