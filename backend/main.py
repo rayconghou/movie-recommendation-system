@@ -4,7 +4,9 @@ import ast
 import re
 from functools import lru_cache
 from pathlib import Path
-from typing import List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple
+
+from dotenv import load_dotenv
 
 import numpy as np
 import pandas as pd
@@ -15,16 +17,27 @@ from sklearn.metrics.pairwise import linear_kernel
 from sklearn.neighbors import NearestNeighbors
 import time
 
+# Load .env from project root so OPENAI_API_KEY is available to embeddings/query_parser
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
+load_dotenv(PROJECT_ROOT / ".env")
+
 from database import (
     DEFAULT_DB_PATH,
     ensure_db,
     get_candidate_row_indices,
     get_connection,
+    load_embeddings_from_dir,
+    load_embeddings_from_db,
     load_movies_dataframe,
 )
+from data_loader import enrich_movies_df
+from embeddings import (
+    query_embedding_for_fields,
+    weighted_similarity_over_candidates,
+)
+from query_parser import parse_query_for_search
 
 
-PROJECT_ROOT = Path(__file__).resolve().parent.parent
 MOVIES_CSV_PATH = PROJECT_ROOT / "movies_metadata.csv"
 
 
@@ -102,6 +115,8 @@ class Recommender:
         self.use_ann_index: bool = False
         self.nn_index: NearestNeighbors | None = None
         self.enable_timing: bool = False
+        # Precomputed per-field embeddings (field -> (n_movies, dim)); None if not available
+        self.field_embeddings: Optional[Dict[str, np.ndarray]] = None
 
         self._load_and_fit()
 
@@ -145,6 +160,9 @@ class Recommender:
                 return " ".join([part for part in [title, overview, genres] if part])
             df["combined_text"] = df.apply(build_text, axis=1)
 
+        # Enrich with credits (actors) and keywords; join at load time by id
+        df = enrich_movies_df(df, PROJECT_ROOT)
+
         self.movies_df = df.reset_index(drop=True)
 
         self.vectorizer = TfidfVectorizer(
@@ -152,8 +170,29 @@ class Recommender:
             ngram_range=(1, 2),
             max_features=50000,
         )
-        self.tfidf_matrix = self.vectorizer.fit_transform(df["combined_text"].astype(str))
+        self.tfidf_matrix = self.vectorizer.fit_transform(
+            self.movies_df["combined_text"].fillna("").astype(str)
+        )
         self.feature_names = self.vectorizer.get_feature_names_out()
+
+        # Load precomputed embeddings from data/embeddings/*.npy (from precompute_embeddings.py); no API calls at startup
+        embed_fields = ["title", "overview", "genres", "actors", "keywords"]
+        if self.db_path is not None:
+            embeddings_dir = self.db_path.parent / "embeddings"
+            self.field_embeddings = load_embeddings_from_dir(embeddings_dir, embed_fields)
+            if self.field_embeddings is None:
+                conn = get_connection(self.db_path)
+                try:
+                    self.field_embeddings = load_embeddings_from_db(conn, embed_fields)
+                finally:
+                    conn.close()
+            if self.field_embeddings is not None:
+                print("[Recommender] Loaded embeddings for fields:", list(self.field_embeddings.keys()))
+            else:
+                print("[Recommender] No precomputed embeddings. Run: cd backend && python precompute_embeddings.py")
+        else:
+            self.field_embeddings = None
+            print("[Recommender] No DB path; embedding search disabled. Use DB + precompute_embeddings.py for embeddings.")
 
         # Optionally build an approximate nearest-neighbor style index over the TF-IDF matrix.
         # This can be enabled by setting `self.use_ann_index = True` after initialization.
@@ -212,8 +251,11 @@ class Recommender:
         if self.tfidf_matrix is None:
             raise RuntimeError("TF-IDF matrix is not initialized.")
 
-        # Deterministic release year range from the query (e.g. "90s" -> 1990-1999).
-        start_year, end_year = parse_year_range_deterministic(query)
+        # LLM query parser: structured intent (genres, keywords, actors, years, fields_to_use).
+        intent = parse_query_for_search(query)
+        start_year, end_year = intent.start_year, intent.end_year
+        if start_year is None and end_year is None:
+            start_year, end_year = parse_year_range_deterministic(query)
 
         # Build candidate index set: use DB when available, else filter on dataframe.
         df = self.movies_df
@@ -247,49 +289,80 @@ class Recommender:
         if candidate_indices.size == 0:
             candidate_indices = all_indices
 
-        t0 = time.perf_counter()
-        query_vec = self.vectorizer.transform([query])
-        t1 = time.perf_counter()
-
         num_candidates = candidate_indices.size
         top_k = min(max(top_k, 0), num_candidates)
 
         if top_k == 0:
             return []
 
-        use_ann = self.use_ann_index and self.nn_index is not None and (
-            start_year is None and end_year is None
+        t0 = time.perf_counter()
+        use_embedding = (
+            self.field_embeddings is not None
+            and intent.fields_to_use
+            and all(
+                f in self.field_embeddings for f in intent.fields_to_use
+            )
         )
+        query_embeddings = None
+        if use_embedding:
+            query_embeddings = query_embedding_for_fields(
+                intent, intent.fields_to_use
+            )
+            if query_embeddings is None:
+                use_embedding = False
 
-        # Use optional ANN index if enabled and no year filter; otherwise fall back to cosine similarities.
-        if use_ann:
-            distances, indices = self.nn_index.kneighbors(query_vec, n_neighbors=top_k)
-            neighbor_indices = indices[0]
-            neighbor_scores = 1.0 - distances[0]
-            top_local_indices = neighbor_indices
-            cosine_similarities = neighbor_scores
-        else:
-            sub_matrix = self.tfidf_matrix[candidate_indices]
-            cosine_similarities = linear_kernel(query_vec, sub_matrix).flatten()
-
-            if cosine_similarities.size == 0:
-                return []
-
-            if top_k >= cosine_similarities.size:
-                top_local_indices = np.argsort(cosine_similarities)[::-1]
+        if use_embedding and query_embeddings is not None:
+            print("[Recommender] Using embedding-based similarity (fields:", intent.fields_to_use, ")")
+            scores = weighted_similarity_over_candidates(
+                candidate_indices,
+                self.field_embeddings,
+                query_embeddings,
+                intent.fields_to_use,
+            )
+            if top_k >= len(scores):
+                top_local_indices = np.argsort(scores)[::-1]
             else:
-                # More efficient top-K selection than sorting the full array.
-                partition_indices = np.argpartition(cosine_similarities, -top_k)[-top_k:]
-                sorted_within_top_k = partition_indices[
-                    np.argsort(cosine_similarities[partition_indices])[::-1]
+                partition_indices = np.argpartition(scores, -top_k)[-top_k:]
+                top_local_indices = partition_indices[
+                    np.argsort(scores[partition_indices])[::-1]
                 ]
-                top_local_indices = sorted_within_top_k
+            cosine_similarities = scores
+        else:
+            print("[Recommender] Using TF-IDF similarity (embedding path unavailable or failed)")
+            query_vec = self.vectorizer.transform([query])
+            use_ann = self.use_ann_index and self.nn_index is not None and (
+                start_year is None and end_year is None
+            )
+            if use_ann:
+                distances, indices = self.nn_index.kneighbors(
+                    query_vec, n_neighbors=top_k
+                )
+                top_local_indices = indices[0]
+                cosine_similarities = (1.0 - distances[0]).astype(np.float64)
+            else:
+                sub_matrix = self.tfidf_matrix[candidate_indices]
+                cosine_similarities = linear_kernel(
+                    query_vec, sub_matrix
+                ).flatten().astype(np.float64)
+                if top_k >= cosine_similarities.size:
+                    top_local_indices = np.argsort(cosine_similarities)[::-1]
+                else:
+                    partition_indices = np.argpartition(
+                        cosine_similarities, -top_k
+                    )[-top_k:]
+                    top_local_indices = partition_indices[
+                        np.argsort(cosine_similarities[partition_indices])[::-1]
+                    ]
 
         t2 = time.perf_counter()
+        t1 = t0  # for timing message
 
         movies: List[MovieResponse] = []
         detailed_justification_k = 10
         year_filter_active = start_year is not None or end_year is not None
+        query_vec = None
+        if not use_embedding:
+            query_vec = self.vectorizer.transform([query])
         for rank_idx, local_idx in enumerate(top_local_indices, start=1):
             movie_idx = candidate_indices[local_idx]
             row = self.movies_df.iloc[movie_idx]
@@ -302,12 +375,11 @@ class Recommender:
             overview_truncated = self._truncate(str(overview) if isinstance(overview, str) else None)
             genres = row.get("parsed_genres") or []
             score = float(cosine_similarities[local_idx])
-            if rank_idx <= detailed_justification_k:
+            if rank_idx <= detailed_justification_k and query_vec is not None:
                 justification = self._build_justification(query, query_vec, movie_idx)
             else:
                 justification = (
-                    "Ranked based on textual similarity between your query and the movie's "
-                    "title, description, and genres."
+                    "Ranked based on similarity to your query (embedding or text match)."
                 )
 
             if year_filter_active:

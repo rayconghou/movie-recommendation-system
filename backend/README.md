@@ -52,3 +52,20 @@ The backend uses an **SQLite database** (created at `../data/movies.db` on first
 - Example: *"movie from the 90s where ship hits iceberg"* first restricts to 1990s, then ranks by TF-IDF similarity to *"movie where ship hits iceberg"* among those candidates only.
 
 The DB schema is in `database.py`; the table is indexed on `release_year` for fast filtering.
+
+## Credits, keywords, and embedding search
+
+- **credits.csv** and **keywords.csv** (in project root) are optional. If present, they are loaded at startup and joined to movies by TMDB `id`. Cast names and keywords are used for search and for embedding-based retrieval.
+- **Precomputed embeddings** are stored in the DB; the backend does **not** call the embedding API at startup. Run the standalone script once (e.g. after adding new movies or changing fields):
+
+  ```bash
+  cd backend
+  # Ensure OPENAI_API_KEY is set in project root .env
+  python precompute_embeddings.py
+  ```
+
+  This loads movies (with credits/keywords), calls the OpenAI embedding API per field, and writes vectors to `movie_embeddings`. Restart the backend to load them; startup is then fast.
+- At **request time**, with **OPENAI_API_KEY** set, the backend:
+  1. Runs an **LLM query parser** to extract structured intent (genres, keywords, actors, fields to use).
+  2. **Embeds the query** (one API call per request) and compares to the precomputed movie embeddings loaded from the DB.
+  3. Ranks by **weighted similarity**; falls back to **TF-IDF** if no precomputed embeddings are in the DB or the query embedding call fails.
